@@ -21,7 +21,7 @@ flags.DEFINE_boolean('combine_dataset', False, 'If True, combines the validation
 
 #Training arguments
 flags.DEFINE_integer('num_classes', 12, 'The number of classes to predict.')
-flags.DEFINE_integer('batch_size', 10, 'The batch_size for training.')
+flags.DEFINE_integer('batch_size', 5, 'The batch_size for training.')
 flags.DEFINE_integer('eval_batch_size', 25, 'The batch size used for validation.')
 flags.DEFINE_integer('image_height', 360, "The input height of the images.")
 flags.DEFINE_integer('image_width', 480, "The input width of the images.")
@@ -30,7 +30,8 @@ flags.DEFINE_integer('num_epochs_before_decay', 100, 'The number of epochs befor
 flags.DEFINE_float('weight_decay', 2e-4, "The weight decay for ENet convolution layers.")
 flags.DEFINE_float('learning_rate_decay_factor', 1e-1, 'The learning rate decay factor.')
 flags.DEFINE_float('initial_learning_rate', 5e-4, 'The initial learning rate for your training.')
-flags.DEFINE_string('weighting', "MFB", 'Choice of Median Frequency Balancing or the custom ENet class weights.')
+flags.DEFINE_string('weighting', "ENET", 'Choice of Median Frequency Balancing or the custom ENet class weights.')
+flags.DEFINE_string("encoder_decoder", 'encoder', 'Train an encoder or the encoder-decoder combination')
 
 #Architectural changes
 flags.DEFINE_integer('num_initial_blocks', 1, 'The number of initial blocks to use in ENet.')
@@ -54,6 +55,12 @@ num_epochs =FLAGS.num_epochs
 learning_rate_decay_factor = FLAGS.learning_rate_decay_factor
 weight_decay = FLAGS.weight_decay
 epsilon = 1e-8
+small_h = 45
+small_w = 60
+if FLAGS.encoder_decoder == 'encoder':
+    encoder = True
+else:
+    encoder = False
 
 #Architectural changes
 num_initial_blocks = FLAGS.num_initial_blocks
@@ -148,7 +155,10 @@ def run():
 
         #preprocess and batch up the image and annotation
         preprocessed_image, preprocessed_annotation = preprocess(image, annotation, image_height, image_width)
-        images, annotations = tf.train.batch([preprocessed_image, preprocessed_annotation], batch_size=batch_size, allow_smaller_final_batch=True)
+        preprocessed_small_annotation = tf.image.resize_nearest_neighbor(tf.expand_dims(preprocessed_annotation, axis=0),
+                                                                         (small_h, small_w))
+        preprocessed_small_annotation = tf.squeeze(preprocessed_small_annotation, axis=0)
+        images, annotations, small_annotations = tf.train.batch([preprocessed_image, preprocessed_annotation, preprocessed_small_annotation], batch_size=batch_size, allow_smaller_final_batch=True)
 
         #Create the model inference
         with slim.arg_scope(ENet_arg_scope(weight_decay=weight_decay)):
@@ -157,13 +167,19 @@ def run():
                                          batch_size=batch_size,
                                          is_training=True,
                                          reuse=None,
+                                         encoder=encoder,
                                          num_initial_blocks=num_initial_blocks,
                                          stage_two_repeat=stage_two_repeat,
                                          skip_connections=skip_connections)
 
         #perform one-hot-encoding on the ground truth annotation to get same shape as the logits
-        annotations = tf.reshape(annotations, shape=[batch_size, image_height, image_width])
-        annotations_ohe = tf.one_hot(annotations, num_classes, axis=-1)
+        if not encoder:
+            annotations = tf.reshape(annotations, shape=[batch_size, image_height, image_width])
+            annotations_ohe = tf.one_hot(annotations, num_classes, axis=-1)
+        else:
+            annotations = tf.reshape(small_annotations, shape=[batch_size, small_h, small_w])
+            annotations_ohe = tf.one_hot(annotations, num_classes, axis=-1)
+            
 
         #Actually compute the loss
         loss = weighted_cross_entropy(logits=logits, onehot_labels=annotations_ohe, class_weights=class_weights)
@@ -221,33 +237,46 @@ def run():
 
         #preprocess and batch up the image and annotation
         preprocessed_image_val, preprocessed_annotation_val = preprocess(image_val, annotation_val, image_height, image_width)
-        images_val, annotations_val = tf.train.batch([preprocessed_image_val, preprocessed_annotation_val], batch_size=eval_batch_size, allow_smaller_final_batch=True)
+        preprocessed_small_annotation = tf.image.resize_nearest_neighbor(tf.expand_dims(preprocessed_annotation, axis=0),
+                                                                         (small_h, small_w))
+        preprocessed_small_annotation = tf.squeeze(preprocessed_small_annotation, axis=0)
+        images_val, annotations_val, small_annotations_val = tf.train.batch([preprocessed_image, preprocessed_annotation, preprocessed_small_annotation], batch_size=eval_batch_size, allow_smaller_final_batch=True)
 
         with slim.arg_scope(ENet_arg_scope(weight_decay=weight_decay)):
             logits_val, probabilities_val = ENet(images_val,
                                                  num_classes,
                                                  batch_size=eval_batch_size,
                                                  is_training=True,
+                                                 encoder=encoder,
                                                  reuse=True,
                                                  num_initial_blocks=num_initial_blocks,
                                                  stage_two_repeat=stage_two_repeat,
                                                  skip_connections=skip_connections)
 
         #perform one-hot-encoding on the ground truth annotation to get same shape as the logits
-        annotations_val = tf.reshape(annotations_val, shape=[eval_batch_size, image_height, image_width])
-        annotations_ohe_val = tf.one_hot(annotations_val, num_classes, axis=-1)
+        if not encoder:
+            annotations = tf.reshape(annotations_val, shape=[eval_batch_size, image_height, image_width])
+            annotations_ohe = tf.one_hot(annotations_val, num_classes, axis=-1)
+        else:
+            annotations = tf.reshape(small_annotations_val, shape=[eval_batch_size, small_h, small_w])
+            annotations_ohe = tf.one_hot(annotations_val, num_classes, axis=-1)
 
         #State the metrics that you want to predict. We get a predictions that is not one_hot_encoded. ----> Should we use OHE instead?
         predictions_val = tf.argmax(probabilities_val, -1)
-        accuracy_val, accuracy_val_update = tf.contrib.metrics.streaming_accuracy(predictions_val, annotations_val)
-        mean_IOU_val, mean_IOU_val_update = tf.contrib.metrics.streaming_mean_iou(predictions=predictions_val, labels=annotations_val, num_classes=num_classes)
+        accuracy_val, accuracy_val_update = tf.contrib.metrics.streaming_accuracy(predictions_val, annotations)
+        mean_IOU_val, mean_IOU_val_update = tf.contrib.metrics.streaming_mean_iou(predictions=predictions_val, labels=annotations, num_classes=num_classes)
         metrics_op_val = tf.group(accuracy_val_update, mean_IOU_val_update)
 
         #Create an output for showing the segmentation output of validation images
         segmentation_output_val = tf.cast(predictions_val, dtype=tf.float32)
-        segmentation_output_val = tf.reshape(segmentation_output_val, shape=[-1, image_height, image_width, 1])
-        segmentation_ground_truth_val = tf.cast(annotations_val, dtype=tf.float32)
-        segmentation_ground_truth_val = tf.reshape(segmentation_ground_truth_val, shape=[-1, image_height, image_width, 1])
+        if not encoder:
+            segmentation_output_val = tf.reshape(segmentation_output_val, shape=[-1, image_height, image_width, 1])
+            segmentation_ground_truth_val = tf.cast(annotations_val, dtype=tf.float32)
+            segmentation_ground_truth_val = tf.reshape(segmentation_ground_truth_val, shape=[-1, image_height, image_width, 1])
+        else:
+            segmentation_output_val = tf.reshape(segmentation_output_val, shape=[-1, small_h, small_w, 1])
+            segmentation_ground_truth_val = tf.cast(annotations_val, dtype=tf.float32)
+            segmentation_ground_truth_val = tf.reshape(segmentation_ground_truth_val, shape=[-1, small_h, small_w, 1])
 
         def eval_step(sess, metrics_op):
             '''
